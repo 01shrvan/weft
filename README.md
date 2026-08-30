@@ -18,12 +18,20 @@ whole reason for building it.
 
 ## Score
 
-| suite | passing |
-|---|---|
-| h2spec | not yet run |
-| `cargo test` | see CI |
+```
+h2spec 2.6.0 | 146 tests, 41 passed, 1 skipped, 104 failed
+```
 
-The h2spec number goes here verbatim, including when it is bad.
+Run against `weft` on 2026-08-30, phase 1 of 5. The 104 failures are real and expected:
+HPACK, the stream state machine and flow control are not built yet, and h2spec tests all
+three heavily. The number goes here verbatim as it moves, including while it is bad.
+
+Reproduce it:
+
+```
+cargo run --release -- 127.0.0.1:8080
+h2spec -h 127.0.0.1 -p 8080
+```
 
 ## Design decisions
 
@@ -39,10 +47,11 @@ mental model worth having. One `std::thread` per connection.
 
 ## Status
 
-Phase 1 of 5. The frame layer decodes; there is no listener yet.
+Phase 1 of 5 complete. The server listens, completes the h2c handshake and answers frame-level traffic. It cannot yet serve a request.
 
 - [x] frame header codec, streaming decoder, error codes
-- [ ] connection preface, `SETTINGS` negotiation, `PING`, `GOAWAY`
+- [x] connection preface, `SETTINGS` negotiation, `PING`, `GOAWAY`, `RST_STREAM`
+- [x] `GOAWAY` on connection errors, `RST_STREAM` on stream errors
 - [ ] HPACK
 - [ ] stream state machine
 - [ ] flow control
