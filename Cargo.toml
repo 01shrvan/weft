@@ -1,0 +1,13 @@
+[package]
+name = "weft"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.74"
+description = "An HTTP/2 server written from raw TCP sockets, graded by h2spec."
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
