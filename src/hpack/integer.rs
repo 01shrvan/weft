@@ -5,7 +5,7 @@ fn compression_error<T>() -> H2Result<T> {
 }
 
 pub fn decode(buf: &[u8], pos: usize, prefix_bits: u8) -> H2Result<(u32, usize)> {
-    debug_assert!(prefix_bits >= 1 && prefix_bits <= 8);
+    debug_assert!((1..=8).contains(&prefix_bits));
     if pos >= buf.len() {
         return compression_error();
     }
@@ -40,7 +40,7 @@ pub fn decode(buf: &[u8], pos: usize, prefix_bits: u8) -> H2Result<(u32, usize)>
 }
 
 pub fn encode(out: &mut Vec<u8>, value: u32, prefix_bits: u8, prefix_value: u8) {
-    debug_assert!(prefix_bits >= 1 && prefix_bits <= 8);
+    debug_assert!((1..=8).contains(&prefix_bits));
     let mask = (1u32 << prefix_bits) - 1;
     let keep = prefix_value & !(mask as u8);
     if value < mask {

@@ -41,8 +41,10 @@ pub struct Connection<S> {
 
 impl<S: Read + Write> Connection<S> {
     pub fn new(io: S) -> Self {
-        let mut local = Settings::default();
-        local.max_concurrent_streams = Some(MAX_CONCURRENT as u32);
+        let local = Settings {
+            max_concurrent_streams: Some(MAX_CONCURRENT as u32),
+            ..Default::default()
+        };
         let remote = Settings::default();
         Connection {
             io,
