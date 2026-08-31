@@ -18,7 +18,7 @@ and RFC 7541, so the score cannot be self-scoped or argued with.
 ## Score
 
 ```
-h2spec 2.6.0     146 tests, 41 passed, 1 skipped, 104 failed
+h2spec 2.6.0     146 tests, 136 passed, 0 skipped, 10 failed
 cargo test       39 passed
 ```
 
@@ -45,13 +45,12 @@ node examples/probe.mjs
 ```
 
 ```
-SETTINGS from server: { headerTableSize: 4096, initialWindowSize: 65535, maxFrameSize: 16384 }
-PING acked in 0.19 ms
-GET / timed out: HEADERS is not handled yet (phase 3)
+SETTINGS from server: { headerTableSize: 4096, initialWindowSize: 65535, maxFrameSize: 16384, maxConcurrentStreams: 100 }
+PING acked in 0.17 ms
+response headers: { status: 200, 'content-type': 'text/plain', 'content-length': '5' }
+body: "weft
+"
 ```
-
-The handshake, SETTINGS negotiation and PING round trip work against a real client. A GET
-does not return, because request headers are not wired up yet.
 
 Grade it against the conformance suite. Download `h2spec` from its
 [releases](https://github.com/summerwind/h2spec/releases), then:
@@ -61,8 +60,8 @@ h2spec -h 127.0.0.1 -p 8080
 ```
 
 ```
-Finished in 209.5065 seconds
-146 tests, 41 passed, 1 skipped, 104 failed
+Finished in 12.1267 seconds
+146 tests, 136 passed, 0 skipped, 10 failed
 ```
 
 Run the unit and RFC-vector tests:
@@ -82,7 +81,15 @@ with size-bounded eviction, and Huffman coding whose table is generated directly
 RFC 7541 Appendix B. It decodes both full request sequences from Appendix C, with the
 dynamic table reaching exactly the sizes the RFC states.
 
-Streams, flow control and serving an actual response are not built.
+Requests are served. The stream state machine tracks idle, open, half-closed and closed
+with the error code the RFC demands on each illegal transition, header blocks are
+assembled across CONTINUATION frames, and requests are validated for pseudo-header
+ordering, duplicates, uppercase names, connection-specific fields and `te`.
+
+The ten remaining h2spec failures are five flow-control cases (the send window is not
+enforced when writing DATA, and existing stream windows are not adjusted when
+SETTINGS_INITIAL_WINDOW_SIZE changes), two content-length mismatch checks, trailers,
+MAX_CONCURRENT_STREAMS enforcement, and PRIORITY self-dependency on a standalone frame.
 
 ## Design decisions
 
