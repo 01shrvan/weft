@@ -76,7 +76,6 @@ impl Settings {
             out.extend_from_slice(&v.to_be_bytes());
         };
         put(HEADER_TABLE_SIZE, self.header_table_size);
-        put(ENABLE_PUSH, u32::from(self.enable_push));
         put(INITIAL_WINDOW_SIZE, self.initial_window_size);
         put(MAX_FRAME_SIZE, self.max_frame_size);
         if let Some(n) = self.max_concurrent_streams {

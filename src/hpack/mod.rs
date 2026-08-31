@@ -1,3 +1,4 @@
+pub mod decoder;
 pub mod huffman;
 pub mod huffman_table;
 pub mod integer;
