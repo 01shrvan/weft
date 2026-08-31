@@ -35,6 +35,7 @@ pub struct Connection<S> {
     highest_client_stream: u32,
     recv_window: i64,
     send_window: i64,
+    out: Vec<u8>,
     saw_first_settings: bool,
     goaway_sent: bool,
 }
@@ -55,6 +56,7 @@ impl<S: Read + Write> Connection<S> {
             highest_client_stream: 0,
             recv_window: i64::from(local.initial_window_size),
             send_window: i64::from(remote.initial_window_size),
+            out: Vec::with_capacity(16 * 1024),
             saw_first_settings: false,
             goaway_sent: false,
             remote,
@@ -68,6 +70,7 @@ impl<S: Read + Write> Connection<S> {
         }
         let mut chunk = [0u8; READ_CHUNK];
         loop {
+            self.flush_out()?;
             let n = match self.io.read(&mut chunk) {
                 Ok(n) => n,
                 Err(_) => return Ok(()),
@@ -113,12 +116,19 @@ impl<S: Read + Write> Connection<S> {
     }
 
     fn write_frame(&mut self, f: &Frame) -> H2Result<()> {
-        self.io
-            .write_all(&f.encode())
-            .map_err(|_| H2Error::Connection(ErrorCode::InternalError))?;
-        self.io
-            .flush()
-            .map_err(|_| H2Error::Connection(ErrorCode::InternalError))
+        f.header.write_into(&mut self.out);
+        self.out.extend_from_slice(&f.payload);
+        Ok(())
+    }
+
+    fn flush_out(&mut self) -> io::Result<()> {
+        if self.out.is_empty() {
+            return Ok(());
+        }
+        self.io.write_all(&self.out)?;
+        self.io.flush()?;
+        self.out.clear();
+        Ok(())
     }
 
     fn conn_err<T>(code: ErrorCode) -> H2Result<T> {
@@ -508,8 +518,9 @@ impl<S: Read + Write> Connection<S> {
         payload.extend_from_slice(&(self.highest_client_stream & 0x7fff_ffff).to_be_bytes());
         payload.extend_from_slice(&code.as_u32().to_be_bytes());
         let f = Frame::new(FrameType::GoAway, 0, 0, payload);
-        self.io.write_all(&f.encode())?;
-        self.io.flush()
+        f.header.write_into(&mut self.out);
+        self.out.extend_from_slice(&f.payload);
+        self.flush_out()
     }
 
     fn fail(&mut self, e: H2Error) -> io::Result<()> {
@@ -518,8 +529,9 @@ impl<S: Read + Write> Connection<S> {
             H2Error::Stream { id, code } => {
                 let body = code.as_u32().to_be_bytes().to_vec();
                 let f = Frame::new(FrameType::RstStream, 0, id, body);
-                self.io.write_all(&f.encode())?;
-                self.io.flush()
+                f.header.write_into(&mut self.out);
+                self.out.extend_from_slice(&f.payload);
+                self.flush_out()
             }
         }
     }
