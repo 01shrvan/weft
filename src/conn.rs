@@ -7,18 +7,21 @@ use crate::hpack::decoder::Decoder;
 use crate::hpack::encoder;
 use crate::hpack::table::Header;
 use crate::settings::Settings;
-use crate::stream::{validate, State, Stream};
+use crate::stream::{validate, validate_trailers, State, Stream};
 
 const READ_CHUNK: usize = 8 * 1024;
 const BODY: &[u8] = b"weft\n";
 const STATUS_200_INDEX: u32 = 8;
 const CONTENT_LENGTH_INDEX: u32 = 28;
 const CONTENT_TYPE_INDEX: u32 = 31;
+const MAX_CONCURRENT: usize = 100;
+const WINDOW_CEILING: i64 = 0x7fff_ffff;
 
 struct Assembly {
     stream_id: u32,
     block: Vec<u8>,
     end_stream: bool,
+    trailers: bool,
 }
 
 pub struct Connection<S> {
@@ -39,19 +42,20 @@ pub struct Connection<S> {
 impl<S: Read + Write> Connection<S> {
     pub fn new(io: S) -> Self {
         let mut local = Settings::default();
-        local.max_concurrent_streams = Some(100);
+        local.max_concurrent_streams = Some(MAX_CONCURRENT as u32);
+        let remote = Settings::default();
         Connection {
             io,
             dec: FrameDecoder::new(),
             hpack: Decoder::new(local.header_table_size as usize),
             streams: HashMap::new(),
             assembly: None,
-            remote: Settings::default(),
             highest_client_stream: 0,
             recv_window: i64::from(local.initial_window_size),
-            send_window: 65_535,
+            send_window: i64::from(remote.initial_window_size),
             saw_first_settings: false,
             goaway_sent: false,
+            remote,
             local,
         }
     }
@@ -74,6 +78,9 @@ impl<S: Read + Write> Connection<S> {
                 match self.dec.next_frame() {
                     Ok(Some(f)) => {
                         if let Err(e) = self.dispatch(f) {
+                            return self.fail(e);
+                        }
+                        if let Err(e) = self.flush_sends() {
                             return self.fail(e);
                         }
                     }
@@ -116,6 +123,10 @@ impl<S: Read + Write> Connection<S> {
         Err(H2Error::Connection(code))
     }
 
+    fn stream_err<T>(id: u32, code: ErrorCode) -> H2Result<T> {
+        Err(H2Error::Stream { id, code })
+    }
+
     fn strip_padding(payload: &[u8], padded: bool) -> H2Result<&[u8]> {
         if !padded {
             return Ok(payload);
@@ -128,6 +139,61 @@ impl<S: Read + Write> Connection<S> {
             return Self::conn_err(ErrorCode::ProtocolError);
         }
         Ok(&payload[1..payload.len() - pad])
+    }
+
+    fn active_streams(&self) -> usize {
+        self.streams.values().filter(|s| s.active()).count()
+    }
+
+    fn flush_sends(&mut self) -> H2Result<()> {
+        let ids: Vec<u32> = self
+            .streams
+            .values()
+            .filter(|s| !s.finished && !s.pending.is_empty())
+            .map(|s| s.id)
+            .collect();
+        for id in ids {
+            self.flush_stream(id)?;
+        }
+        Ok(())
+    }
+
+    fn flush_stream(&mut self, id: u32) -> H2Result<()> {
+        loop {
+            let max_frame = i64::from(self.remote.max_frame_size);
+            let (window, remaining) = match self.streams.get(&id) {
+                Some(s) => (i64::min(s.send_window, self.send_window), s.pending.len() as i64),
+                None => return Ok(()),
+            };
+            if remaining == 0 {
+                return Ok(());
+            }
+            let take = i64::min(i64::min(window, remaining), max_frame);
+            if take <= 0 {
+                return Ok(());
+            }
+            let take = take as usize;
+            let (chunk, last) = match self.streams.get_mut(&id) {
+                Some(s) => {
+                    let chunk: Vec<u8> = s.pending.drain(..take).collect();
+                    let last = s.pending.is_empty();
+                    s.send_window -= take as i64;
+                    (chunk, last)
+                }
+                None => return Ok(()),
+            };
+            self.send_window -= take as i64;
+            let flags = if last { flag::END_STREAM } else { 0 };
+            let data = Frame::new(FrameType::Data, flags, id, chunk);
+            self.write_frame(&data)?;
+            if last {
+                if let Some(s) = self.streams.get_mut(&id) {
+                    s.finished = true;
+                    s.state = State::Closed;
+                }
+                return Ok(());
+            }
+        }
     }
 
     fn dispatch(&mut self, f: Frame) -> H2Result<()> {
@@ -152,8 +218,18 @@ impl<S: Read + Write> Connection<S> {
                     }
                     return Ok(());
                 }
+                let previous = self.remote.initial_window_size;
                 let mut next = self.remote;
                 next.apply(&f.payload)?;
+                let delta = i64::from(next.initial_window_size) - i64::from(previous);
+                if delta != 0 {
+                    for s in self.streams.values_mut() {
+                        s.send_window += delta;
+                        if s.send_window > WINDOW_CEILING {
+                            return Self::conn_err(ErrorCode::FlowControlError);
+                        }
+                    }
+                }
                 self.remote = next;
                 self.hpack.set_settings_limit(next.header_table_size as usize);
                 let ack = Frame::new(FrameType::Settings, flag::ACK, 0, Vec::new());
@@ -190,29 +266,26 @@ impl<S: Read + Write> Connection<S> {
                 }
                 let raw = [f.payload[0], f.payload[1], f.payload[2], f.payload[3]];
                 let inc = i64::from(u32::from_be_bytes(raw) & 0x7fff_ffff);
-                if inc == 0 {
-                    if h.stream_id == 0 {
+                if h.stream_id == 0 {
+                    if inc == 0 {
                         return Self::conn_err(ErrorCode::ProtocolError);
                     }
-                    return Err(H2Error::Stream {
-                        id: h.stream_id,
-                        code: ErrorCode::ProtocolError,
-                    });
-                }
-                if h.stream_id == 0 {
                     self.send_window += inc;
-                    if self.send_window > 0x7fff_ffff {
+                    if self.send_window > WINDOW_CEILING {
                         return Self::conn_err(ErrorCode::FlowControlError);
                     }
                     return Ok(());
                 }
+                if h.stream_id > self.highest_client_stream {
+                    return Self::conn_err(ErrorCode::ProtocolError);
+                }
+                if inc == 0 {
+                    return Self::stream_err(h.stream_id, ErrorCode::ProtocolError);
+                }
                 if let Some(s) = self.streams.get_mut(&h.stream_id) {
                     s.send_window += inc;
-                    if s.send_window > 0x7fff_ffff {
-                        return Err(H2Error::Stream {
-                            id: h.stream_id,
-                            code: ErrorCode::FlowControlError,
-                        });
+                    if s.send_window > WINDOW_CEILING {
+                        return Self::stream_err(h.stream_id, ErrorCode::FlowControlError);
                     }
                 }
                 Ok(())
@@ -223,10 +296,12 @@ impl<S: Read + Write> Connection<S> {
                     return Self::conn_err(ErrorCode::ProtocolError);
                 }
                 if h.length != 5 {
-                    return Err(H2Error::Stream {
-                        id: h.stream_id,
-                        code: ErrorCode::FrameSizeError,
-                    });
+                    return Self::stream_err(h.stream_id, ErrorCode::FrameSizeError);
+                }
+                let raw = [f.payload[0], f.payload[1], f.payload[2], f.payload[3]];
+                let dep = u32::from_be_bytes(raw) & 0x7fff_ffff;
+                if dep == h.stream_id {
+                    return Self::stream_err(h.stream_id, ErrorCode::ProtocolError);
                 }
                 Ok(())
             }
@@ -243,6 +318,8 @@ impl<S: Read + Write> Connection<S> {
                 }
                 if let Some(s) = self.streams.get_mut(&h.stream_id) {
                     s.state = State::Closed;
+                    s.finished = true;
+                    s.pending.clear();
                 }
                 Ok(())
             }
@@ -256,11 +333,23 @@ impl<S: Read + Write> Connection<S> {
                 if h.stream_id < self.highest_client_stream {
                     return Self::conn_err(ErrorCode::ProtocolError);
                 }
-                if let Some(s) = self.streams.get(&h.stream_id) {
-                    if s.state != State::Idle {
-                        return Self::conn_err(ErrorCode::StreamClosed);
+
+                let existing = self.streams.get(&h.stream_id).map(|s| s.state);
+                let trailers = match existing {
+                    Some(State::Open) => {
+                        if !h.has(flag::END_STREAM) {
+                            return Self::conn_err(ErrorCode::ProtocolError);
+                        }
+                        true
                     }
+                    Some(_) => return Self::conn_err(ErrorCode::StreamClosed),
+                    None => false,
+                };
+
+                if !trailers && self.active_streams() >= MAX_CONCURRENT {
+                    return Self::stream_err(h.stream_id, ErrorCode::RefusedStream);
                 }
+
                 self.highest_client_stream = h.stream_id;
 
                 let body = Self::strip_padding(&f.payload, h.has(flag::PADDED))?;
@@ -268,8 +357,8 @@ impl<S: Read + Write> Connection<S> {
                     if body.len() < 5 {
                         return Self::conn_err(ErrorCode::FrameSizeError);
                     }
-                    let dep = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7fff_ffff;
-                    if dep == h.stream_id {
+                    let raw = [body[0], body[1], body[2], body[3]];
+                    if u32::from_be_bytes(raw) & 0x7fff_ffff == h.stream_id {
                         return Self::conn_err(ErrorCode::ProtocolError);
                     }
                     &body[5..]
@@ -277,19 +366,19 @@ impl<S: Read + Write> Connection<S> {
                     body
                 };
 
-                let mut stream = Stream::new(
-                    h.stream_id,
-                    i64::from(self.remote.initial_window_size),
-                    i64::from(self.local.initial_window_size),
-                );
-                stream.state = State::Open;
+                if !trailers {
+                    let initial = i64::from(self.remote.initial_window_size);
+                    let mut stream = Stream::new(h.stream_id, initial);
+                    stream.state = State::Open;
+                    self.streams.insert(h.stream_id, stream);
+                }
+
                 let assembly = Assembly {
                     stream_id: h.stream_id,
                     block: block.to_vec(),
                     end_stream: h.has(flag::END_STREAM),
+                    trailers,
                 };
-                self.streams.insert(h.stream_id, stream);
-
                 if h.has(flag::END_HEADERS) {
                     self.finish_headers(assembly)
                 } else {
@@ -323,20 +412,20 @@ impl<S: Read + Write> Connection<S> {
                 if len > self.recv_window {
                     return Self::conn_err(ErrorCode::FlowControlError);
                 }
-                let state = self.streams.get(&h.stream_id).map(|s| s.state);
-                match state {
+                match self.streams.get(&h.stream_id).map(|s| s.state) {
                     None => return Self::conn_err(ErrorCode::ProtocolError),
                     Some(State::Idle) => return Self::conn_err(ErrorCode::ProtocolError),
                     Some(State::Closed) => return Self::conn_err(ErrorCode::StreamClosed),
                     Some(State::HalfClosedRemote) => {
-                        return Err(H2Error::Stream {
-                            id: h.stream_id,
-                            code: ErrorCode::StreamClosed,
-                        })
+                        return Self::stream_err(h.stream_id, ErrorCode::StreamClosed)
                     }
                     _ => {}
                 }
-                Self::strip_padding(&f.payload, h.has(flag::PADDED))?;
+                let body = Self::strip_padding(&f.payload, h.has(flag::PADDED))?;
+                let received = body.len() as u64;
+                if let Some(s) = self.streams.get_mut(&h.stream_id) {
+                    s.data_received += received;
+                }
                 if h.length > 0 {
                     let refill = Frame::new(
                         FrameType::WindowUpdate,
@@ -347,6 +436,7 @@ impl<S: Read + Write> Connection<S> {
                     self.write_frame(&refill)?;
                 }
                 if h.has(flag::END_STREAM) {
+                    self.check_content_length(h.stream_id)?;
                     if let Some(s) = self.streams.get_mut(&h.stream_id) {
                         s.state = State::HalfClosedRemote;
                     }
@@ -359,17 +449,32 @@ impl<S: Read + Write> Connection<S> {
         }
     }
 
+    fn check_content_length(&self, id: u32) -> H2Result<()> {
+        if let Some(s) = self.streams.get(&id) {
+            if let Some(declared) = s.content_length {
+                if declared != s.data_received {
+                    return Self::stream_err(id, ErrorCode::ProtocolError);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn finish_headers(&mut self, assembly: Assembly) -> H2Result<()> {
         let headers: Vec<Header> = self.hpack.decode(&assembly.block)?;
-        validate(assembly.stream_id, &headers)?;
-        if let Some(s) = self.streams.get_mut(&assembly.stream_id) {
-            s.state = if assembly.end_stream {
-                State::HalfClosedRemote
-            } else {
-                State::Open
-            };
+        if assembly.trailers {
+            validate_trailers(assembly.stream_id, &headers)?;
+        } else {
+            let req = validate(assembly.stream_id, &headers)?;
+            if let Some(s) = self.streams.get_mut(&assembly.stream_id) {
+                s.content_length = req.content_length;
+            }
         }
         if assembly.end_stream {
+            self.check_content_length(assembly.stream_id)?;
+            if let Some(s) = self.streams.get_mut(&assembly.stream_id) {
+                s.state = State::HalfClosedRemote;
+            }
             self.respond(assembly.stream_id)?;
         }
         Ok(())
@@ -384,12 +489,12 @@ impl<S: Read + Write> Connection<S> {
 
         let headers = Frame::new(FrameType::Headers, flag::END_HEADERS, stream_id, block);
         self.write_frame(&headers)?;
-        let data = Frame::new(FrameType::Data, flag::END_STREAM, stream_id, BODY.to_vec());
-        self.write_frame(&data)?;
         if let Some(s) = self.streams.get_mut(&stream_id) {
-            s.state = State::Closed;
+            s.headers_sent = true;
+            s.pending = BODY.to_vec();
+            s.state = State::HalfClosedLocal;
         }
-        Ok(())
+        self.flush_stream(stream_id)
     }
 
     fn goaway(&mut self, code: ErrorCode) -> io::Result<()> {

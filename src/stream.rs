@@ -15,17 +15,32 @@ pub struct Stream {
     pub id: u32,
     pub state: State,
     pub send_window: i64,
-    pub recv_window: i64,
+    pub content_length: Option<u64>,
+    pub data_received: u64,
+    pub pending: Vec<u8>,
+    pub headers_sent: bool,
+    pub finished: bool,
 }
 
 impl Stream {
-    pub fn new(id: u32, initial_send: i64, initial_recv: i64) -> Self {
+    pub fn new(id: u32, initial_send: i64) -> Self {
         Stream {
             id,
             state: State::Idle,
             send_window: initial_send,
-            recv_window: initial_recv,
+            content_length: None,
+            data_received: 0,
+            pending: Vec::new(),
+            headers_sent: false,
+            finished: false,
         }
+    }
+
+    pub fn active(&self) -> bool {
+        matches!(
+            self.state,
+            State::Open | State::HalfClosedRemote | State::HalfClosedLocal
+        )
     }
 }
 
@@ -50,6 +65,28 @@ pub struct Request {
     pub scheme: Option<Vec<u8>>,
     pub path: Option<Vec<u8>>,
     pub authority: Option<Vec<u8>>,
+    pub content_length: Option<u64>,
+}
+
+fn check_name(id: u32, name: &[u8]) -> H2Result<()> {
+    if name.is_empty() {
+        return stream_error(id);
+    }
+    if name.iter().any(|b| b.is_ascii_uppercase()) {
+        return stream_error(id);
+    }
+    Ok(())
+}
+
+fn check_regular(id: u32, h: &Header) -> H2Result<()> {
+    let name = String::from_utf8_lossy(&h.name).into_owned();
+    if CONNECTION_SPECIFIC.contains(&name.as_str()) {
+        return stream_error(id);
+    }
+    if name == "te" && h.value.as_slice() != b"trailers" {
+        return stream_error(id);
+    }
+    Ok(())
 }
 
 pub fn validate(id: u32, headers: &[Header]) -> H2Result<Request> {
@@ -57,12 +94,7 @@ pub fn validate(id: u32, headers: &[Header]) -> H2Result<Request> {
     let mut seen_regular = false;
 
     for h in headers {
-        if h.name.is_empty() {
-            return stream_error(id);
-        }
-        if h.name.iter().any(|b| b.is_ascii_uppercase()) {
-            return stream_error(id);
-        }
+        check_name(id, &h.name)?;
 
         if h.name[0] == b':' {
             if seen_regular {
@@ -83,12 +115,20 @@ pub fn validate(id: u32, headers: &[Header]) -> H2Result<Request> {
         }
 
         seen_regular = true;
-        let name = String::from_utf8_lossy(&h.name).into_owned();
-        if CONNECTION_SPECIFIC.contains(&name.as_str()) {
-            return stream_error(id);
-        }
-        if name == "te" && h.value.as_slice() != b"trailers" {
-            return stream_error(id);
+        check_regular(id, h)?;
+
+        if h.name.as_slice() == b"content-length" {
+            let text = String::from_utf8_lossy(&h.value).into_owned();
+            let parsed = text.parse::<u64>();
+            match parsed {
+                Ok(n) => {
+                    if req.content_length.is_some() && req.content_length != Some(n) {
+                        return stream_error(id);
+                    }
+                    req.content_length = Some(n);
+                }
+                Err(_) => return stream_error(id),
+            }
         }
     }
 
@@ -99,4 +139,15 @@ pub fn validate(id: u32, headers: &[Header]) -> H2Result<Request> {
         return stream_error(id);
     }
     Ok(req)
+}
+
+pub fn validate_trailers(id: u32, headers: &[Header]) -> H2Result<()> {
+    for h in headers {
+        check_name(id, &h.name)?;
+        if h.name[0] == b':' {
+            return stream_error(id);
+        }
+        check_regular(id, h)?;
+    }
+    Ok(())
 }
