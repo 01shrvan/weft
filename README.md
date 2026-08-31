@@ -10,7 +10,22 @@ h2spec 2.6.0     146 tests, 146 passed, 0 skipped, 0 failed
 cargo test        39 passed
 ```
 
+## Install
+
+```
+cargo install weft-h2
+```
+
+The crate is `weft-h2` because `weft` was taken on crates.io in 2018. The binary it
+installs is `weft`.
+
 ## Run
+
+```
+weft 127.0.0.1:8080
+```
+
+From a clone:
 
 ```
 cargo run --release -- 127.0.0.1:8080
@@ -85,3 +100,7 @@ response cost four syscalls and two TCP segments.
 ## Notes
 
 h2c only, no TLS. Synchronous, one `std::thread` per connection, no tokio.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

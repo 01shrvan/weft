@@ -1,10 +1,22 @@
 [package]
-name = "weft"
-version = "0.0.1"
+name = "weft-h2"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
-description = "An HTTP/2 server written from raw TCP sockets, graded by h2spec."
+description = "An HTTP/2 server written from raw TCP sockets, graded 146/146 by h2spec. Zero dependencies."
 license = "MIT"
+repository = "https://github.com/01shrvan/weft"
+readme = "README.md"
+keywords = ["http2", "h2c", "hpack", "server", "http"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[lib]
+name = "weft"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weft"
+path = "src/main.rs"
 
 [dependencies]
 
